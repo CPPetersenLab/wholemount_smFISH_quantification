@@ -1,136 +1,73 @@
 #!/usr/bin/env python3
-"""Reassign smFISH spots to once-expanded nuclei linked across z-substacks.
+"""Assign smFISH spots to the nearest cleaned Cellpose nucleus in calibrated 3-D.
 
-This script replaces the separate assignment/export notebook steps used for
-experiments 306, 307, 314, and 332.  It performs four operations consistently:
+Batch pipeline for experiments 304, 306, 307, 314, and 332. It replaces the
+old projection-linking/XY-expansion assignment workflow. For each sample it
+uses the cleaned globally stitched Cellpose label stack, assigns each valid
+(z,y,x) spot to the nearest nuclear voxel, writes an assignment-count map,
+creates a reproducibly random 512x512 five-view example, and produces
+biological-replicate-level tables, plots, unpaired Welch tests, and Dunn tests.
 
-1. Discover every ``<sample>/565/results`` directory below configured roots.
-2. Read the *original* 2-D nuclear label projections from ``results/labels``.
-3. Link likely representations of the same nucleus in adjacent projections.
-4. Expand each original label image exactly once, assign spots to linked cells,
-   and write per-cell, per-animal, wide positive-cell, and QC CSV files.
+Typical run::
 
-The linking rule is deliberately conservative.  Labels in adjacent projections
-are joined only when they are reciprocal best-overlap partners and satisfy at
-least one configured overlap threshold.  Every link is exported for auditing.
+    caffeinate -ims python reassign_smfish_3d.py 2>&1 | \
+      tee -a smfish_cellpose_assignment.log
 
-Default experiment roots are the paths supplied for the current manuscript.
-They can be replaced with repeatable ``--experiment NAME,GENE,ROOT`` arguments.
-
-Typical use on the acquisition/analysis Mac::
-
-    python reassign_smfish_3d.py \
-      --output-root "/Volumes/Backup Plus/Experiment_results/reassignment_v2"
-
-Run a synthetic end-to-end validation before processing real data::
-
-    python reassign_smfish_3d.py --self-test
-
-Required packages: numpy, pandas, scipy, scikit-image, tifffile.
+Required: numpy, pandas, scipy, matplotlib, tifffile.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
 import re
 import shutil
-import sys
 import tempfile
-from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy import ndimage, stats
 
 try:
-    from skimage.segmentation import expand_labels as _skimage_expand_labels
-except ImportError:  # portable fallback used by the validation environment
-    _skimage_expand_labels = None
-
-try:
-    from tifffile import imread as _tifffile_imread
-    from tifffile import imwrite as _tifffile_imwrite
-except ImportError:  # portable fallback; the user's notebook env has tifffile
-    _tifffile_imread = None
-    _tifffile_imwrite = None
+    from tifffile import TiffFile, TiffWriter, imread as tifffile_imread
+except ImportError:
+    TiffFile = None
+    TiffWriter = None
+    tifffile_imread = None
 
 
-def imread(path: str | Path) -> np.ndarray:
-    if _tifffile_imread is not None:
-        return np.asarray(_tifffile_imread(path))
-    try:
-        from PIL import Image
-    except ImportError as exc:  # pragma: no cover
-        raise SystemExit("Install tifffile or Pillow to read label TIFF files") from exc
-    return np.asarray(Image.open(path))
-
-
-def imwrite(path: str | Path, array: np.ndarray, **kwargs: object) -> None:
-    if _tifffile_imwrite is not None:
-        _tifffile_imwrite(path, array, **kwargs)
-        return
-    try:
-        from PIL import Image
-    except ImportError as exc:  # pragma: no cover
-        raise SystemExit("Install tifffile or Pillow to write TIFF files") from exc
-    Image.fromarray(np.asarray(array)).save(path)
-
-
-def expand_labels(labels: np.ndarray, distance: float) -> np.ndarray:
-    """Use skimage when available; otherwise reproduce nearest-label expansion."""
-
-    if distance <= 0:
-        return labels.copy()
-    if _skimage_expand_labels is not None:
-        return _skimage_expand_labels(labels, distance=distance)
-    try:
-        from scipy.ndimage import distance_transform_edt
-    except ImportError as exc:  # pragma: no cover
-        raise SystemExit("Install scikit-image or scipy for label expansion") from exc
-    distances, nearest = distance_transform_edt(
-        labels == 0,
-        return_distances=True,
-        return_indices=True,
-    )
-    expanded = labels.copy()
-    mask = (labels == 0) & (distances <= distance)
-    nearest_labels = labels[tuple(nearest)]
-    expanded[mask] = nearest_labels[mask]
-    return expanded
-
-
-SCRIPT_VERSION = "1.0.1"
-LOGGER = logging.getLogger("smfish_reassignment")
-
-
-DEFAULT_EXPERIMENTS = (
-    (
-        "306",
-        "wnt1",
-        "/Volumes/Backup Plus/Experiment_results/306_analysis_results_alter",
-    ),
-    (
-        "307",
-        "wnt1",
-        "/Volumes/Backup Plus/Experiment_results/307_analysis_resutls/307_quantificatoin",
-    ),
-    (
-        "314",
-        "notum",
-        "/Volumes/Backup Plus/Experiment_results/314_analysis_results",
-    ),
-    (
-        "332",
-        "notum",
-        "/Volumes/Backup Plus/Experiment_results/332_notum_analysis",
-    ),
+SCRIPT_VERSION = "2.0.0"
+LOGGER = logging.getLogger("smfish_cellpose_assignment")
+FINAL_LABEL_DIRNAME = "cellpose_label_plane_s4_cp-1p75_f0p8_d90_n500_st0p25"
+CLEANED_LABEL_DIRNAME = FINAL_LABEL_DIRNAME + "_cleaned"
+DEFAULT_OUTPUT_ROOT = Path(
+    "/Volumes/Backup Plus/Experiment_results/smFISH_cellpose_assignment"
 )
+DEFAULT_EXPERIMENTS = (
+    ("304", "wnt1", "/Volumes/Backup Plus/Experiment_results/304_Analysis_results", (64.0, 64.0, 361.0)),
+    ("306", "wnt1", "/Volumes/Backup Plus/Experiment_results/306_analysis_results_alter", (64.0, 64.0, 361.0)),
+    ("307", "wnt1", "/Volumes/Backup Plus/Experiment_results/307_analysis_resutls/307_quantificatoin", (64.0, 64.0, 361.0)),
+    ("314", "notum", "/Volumes/Backup Plus/Experiment_results/314_analysis_results", (74.0, 74.0, 500.0)),
+    ("332", "notum", "/Volumes/Backup Plus/Experiment_results/332_notum_analysis", (74.0, 74.0, 500.0)),
+)
+LABEL_INDEX_PATTERN = re.compile(r"Nucleus_Labels_(\d+)")
+THRESHOLDS = (1, 5, 10)
+INJURY_ORDER = ("incision", "amputation", "held_open", "dorsal_window", "unparsed")
+INJURY_COLORS = {
+    "incision": "#377eb8", "amputation": "#e41a1c", "held_open": "#4daf4a",
+    "dorsal_window": "#984ea3", "unparsed": "#777777",
+}
 
 
 @dataclass(frozen=True)
@@ -138,23 +75,28 @@ class ExperimentSpec:
     name: str
     gene: str
     root: Path
+    voxel_xyz_nm: tuple[float, float, float]
+
+    @property
+    def voxel_zyx_um(self) -> tuple[float, float, float]:
+        x_nm, y_nm, z_nm = self.voxel_xyz_nm
+        return z_nm / 1000.0, y_nm / 1000.0, x_nm / 1000.0
 
 
 @dataclass(frozen=True)
 class Parameters:
-    projection_size: int
-    expansion_distance: float
-    min_smaller_overlap: float
-    min_iou: float
     channel_folder: str
+    cleaned_label_dirname: str
+    crop_size: int
+    random_seed: int
+    max_link_lines: int
     save_assignment_maps: bool
+    save_examples: bool
 
 
 @dataclass(frozen=True)
 class SampleSpec:
-    experiment: str
-    gene: str
-    experiment_root: Path
+    experiment: ExperimentSpec
     condition: str
     animal: str
     sample_dir: Path
@@ -162,377 +104,63 @@ class SampleSpec:
 
     @property
     def sample_id(self) -> str:
-        return f"{self.experiment}__{self.condition}__{self.animal}"
+        return f"{self.experiment.name}__{self.condition}__{self.animal}"
+
+    @property
+    def replicate_name(self) -> str:
+        return f"{self.condition}__{self.animal}"
 
 
-class UnionFind:
-    """Small union-find implementation for (projection, local-label) nodes."""
-
-    def __init__(self) -> None:
-        self.parent: dict[tuple[int, int], tuple[int, int]] = {}
-        self.rank: dict[tuple[int, int], int] = {}
-
-    def add(self, item: tuple[int, int]) -> None:
-        if item not in self.parent:
-            self.parent[item] = item
-            self.rank[item] = 0
-
-    def find(self, item: tuple[int, int]) -> tuple[int, int]:
-        parent = self.parent[item]
-        if parent != item:
-            self.parent[item] = self.find(parent)
-        return self.parent[item]
-
-    def union(self, first: tuple[int, int], second: tuple[int, int]) -> None:
-        self.add(first)
-        self.add(second)
-        root_a = self.find(first)
-        root_b = self.find(second)
-        if root_a == root_b:
-            return
-        rank_a = self.rank[root_a]
-        rank_b = self.rank[root_b]
-        if rank_a < rank_b:
-            root_a, root_b = root_b, root_a
-        self.parent[root_b] = root_a
-        if rank_a == rank_b:
-            self.rank[root_a] += 1
-
-
-def natural_key(path_or_name: str | Path) -> list[object]:
-    """Sort paths containing numbers in human/numeric order."""
-
-    name = Path(path_or_name).name
-    return [int(piece) if piece.isdigit() else piece.lower() for piece in re.split(r"(\d+)", name)]
-
-
-def parse_experiment_argument(value: str) -> ExperimentSpec:
-    """Parse NAME,GENE,ROOT while allowing commas inside ROOT after field two."""
-
-    parts = value.split(",", 2)
-    if len(parts) != 3 or not all(part.strip() for part in parts):
-        raise argparse.ArgumentTypeError(
-            "--experiment must be formatted as NAME,GENE,ROOT"
-        )
-    name, gene, root = (part.strip() for part in parts)
-    return ExperimentSpec(name=name, gene=gene, root=Path(root))
+@dataclass
+class CellAccumulator:
+    voxel_count: int = 0
+    sum_z: float = 0.0
+    sum_y: float = 0.0
+    sum_x: float = 0.0
+    first_z: int = 2**31 - 1
+    last_z: int = -1
+    n_z_planes: int = 0
+    max_cross_section_pixels: int = 0
+    example_z: int = -1
+    example_y: float = math.nan
+    example_x: float = math.nan
 
 
 def configure_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=level,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
-    # Pillow emits every TIFF tag at DEBUG level; keep pipeline diagnostics
-    # readable when --verbose is enabled.
     logging.getLogger("PIL").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 
-def discover_samples(spec: ExperimentSpec, channel_folder: str) -> list[SampleSpec]:
-    """Find only ``Experiment/<condition>/<animal>/<channel>/results`` samples.
+def natural_key(path_or_name: str | Path) -> list[object]:
+    return [int(p) if p.isdigit() else p.lower()
+            for p in re.split(r"(\d+)", Path(path_or_name).name)]
 
-    Experiment roots can also contain Control or other analysis folders with
-    their own ``565/results`` paths.  Those are intentionally excluded.
-    """
 
-    if not spec.root.exists():
-        LOGGER.warning("Experiment root does not exist; skipping: %s", spec.root)
-        return []
-
-    samples: list[SampleSpec] = []
-    for results_dir in spec.root.rglob("results"):
-        if not results_dir.is_dir() or results_dir.parent.name != channel_folder:
-            continue
-        sample_dir = results_dir.parent.parent
-        condition_dir = sample_dir.parent
-        experiment_dir = condition_dir.parent
-        if experiment_dir.name.lower() != "experiment":
-            LOGGER.debug(
-                "Ignoring results directory outside an Experiment subtree: %s",
-                results_dir,
-            )
-            continue
-        samples.append(
-            SampleSpec(
-                experiment=spec.name,
-                gene=spec.gene,
-                experiment_root=spec.root,
-                condition=condition_dir.name,
-                animal=sample_dir.name,
-                sample_dir=sample_dir,
-                results_dir=results_dir,
-            )
+def parse_experiment_argument(value: str) -> ExperimentSpec:
+    parts = value.split(",", 5)
+    if len(parts) != 6 or not all(part.strip() for part in parts):
+        raise argparse.ArgumentTypeError(
+            "--experiment must be NAME,GENE,ROOT,X_NM,Y_NM,Z_NM"
         )
-
-    unique = {sample.results_dir.resolve(): sample for sample in samples}
-    return sorted(
-        unique.values(),
-        key=lambda item: (
-            natural_key(item.condition),
-            natural_key(item.animal),
-            str(item.results_dir),
-        ),
-    )
-
-
-def locate_label_files(results_dir: Path) -> list[Path]:
-    """Return original, unexpanded nuclear label images in projection order."""
-
-    label_dir = results_dir / "labels"
-    if not label_dir.exists():
-        raise FileNotFoundError(f"Original label directory is missing: {label_dir}")
-
-    preferred = sorted(label_dir.glob("Nucleus_Labels_*.tif*"), key=natural_key)
-    if preferred:
-        return preferred
-
-    fallback = sorted(label_dir.glob("*.tif*"), key=natural_key)
-    if not fallback:
-        raise FileNotFoundError(f"No TIFF label files found in: {label_dir}")
-    LOGGER.warning(
-        "No Nucleus_Labels_*.tif files in %s; using all TIFF files", label_dir
-    )
-    return fallback
-
-
-def locate_spot_file(results_dir: Path) -> Path:
-    """Use background-filtered spots when present, matching the legacy pipeline."""
-
-    candidates = (
-        results_dir / "spots_post_decomposition_and_background_removed.npy",
-        results_dir / "spots_post_decomposition.npy",
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        "Neither spots_post_decomposition_and_background_removed.npy nor "
-        f"spots_post_decomposition.npy exists in {results_dir}"
-    )
-
-
-def read_label(path: Path) -> np.ndarray:
-    labels = np.asarray(imread(path))
-    labels = np.squeeze(labels)
-    if labels.ndim != 2:
-        raise ValueError(f"Expected one 2-D label image at {path}; got {labels.shape}")
-    if not np.issubdtype(labels.dtype, np.integer):
-        if not np.all(np.equal(labels, np.floor(labels))):
-            raise ValueError(f"Label image contains non-integer values: {path}")
-    labels = labels.astype(np.int64, copy=False)
-    if np.any(labels < 0):
-        raise ValueError(f"Label image contains negative labels: {path}")
-    return labels
-
-
-def validate_label_sequence(label_files: Sequence[Path]) -> tuple[int, int]:
-    if not label_files:
-        raise ValueError("No label projections were provided")
-    expected_shape: tuple[int, int] | None = None
-    for path in label_files:
-        labels = read_label(path)
-        if expected_shape is None:
-            expected_shape = labels.shape
-        elif labels.shape != expected_shape:
-            raise ValueError(
-                f"Label image shape mismatch: {path} has {labels.shape}, "
-                f"expected {expected_shape}"
-            )
-    assert expected_shape is not None
-    return expected_shape
-
-
-def label_areas(labels: np.ndarray) -> np.ndarray:
-    return np.bincount(labels.ravel(), minlength=int(labels.max()) + 1)
-
-
-def reciprocal_best_links(
-    labels_a: np.ndarray,
-    labels_b: np.ndarray,
-    projection_a: int,
-    min_smaller_overlap: float,
-    min_iou: float,
-) -> list[dict[str, float | int]]:
-    """Find conservative one-to-one links between adjacent label projections.
-
-    Candidate pairs must overlap in x-y.  Each accepted pair must be the
-    highest-intersection partner for both labels and must meet either the
-    intersection/smaller-area threshold or the IoU threshold.
-    """
-
-    if labels_a.shape != labels_b.shape:
-        raise ValueError("Adjacent label projections have different shapes")
-
-    overlap_mask = (labels_a > 0) & (labels_b > 0)
-    if not np.any(overlap_mask):
-        return []
-
-    a_values = labels_a[overlap_mask].astype(np.int64, copy=False)
-    b_values = labels_b[overlap_mask].astype(np.int64, copy=False)
-    base = int(labels_b.max()) + 1
-    encoded = a_values * base + b_values
-    pair_codes, intersections = np.unique(encoded, return_counts=True)
-    a_ids = pair_codes // base
-    b_ids = pair_codes % base
-
-    areas_a = label_areas(labels_a)
-    areas_b = label_areas(labels_b)
-
-    smaller_fraction = intersections / np.minimum(areas_a[a_ids], areas_b[b_ids])
-    iou = intersections / (
-        areas_a[a_ids] + areas_b[b_ids] - intersections
-    )
-
-    # Determine reciprocal best partners using intersection size.  A tie is
-    # resolved deterministically by the smaller partner label ID.
-    best_for_a: dict[int, tuple[int, int]] = {}
-    best_for_b: dict[int, tuple[int, int]] = {}
-    for index, (a_id, b_id, intersection) in enumerate(
-        zip(a_ids, b_ids, intersections, strict=True)
-    ):
-        a_id_int = int(a_id)
-        b_id_int = int(b_id)
-        intersection_int = int(intersection)
-        current_a = best_for_a.get(a_id_int)
-        if current_a is None or (intersection_int, -b_id_int) > (
-            current_a[1],
-            -current_a[0],
-        ):
-            best_for_a[a_id_int] = (b_id_int, intersection_int)
-        current_b = best_for_b.get(b_id_int)
-        if current_b is None or (intersection_int, -a_id_int) > (
-            current_b[1],
-            -current_b[0],
-        ):
-            best_for_b[b_id_int] = (a_id_int, intersection_int)
-
-    links: list[dict[str, float | int]] = []
-    for index, (a_id, b_id, intersection, overlap_fraction, pair_iou) in enumerate(
-        zip(
-            a_ids,
-            b_ids,
-            intersections,
-            smaller_fraction,
-            iou,
-            strict=True,
-        )
-    ):
-        a_id_int = int(a_id)
-        b_id_int = int(b_id)
-        reciprocal = (
-            best_for_a[a_id_int][0] == b_id_int
-            and best_for_b[b_id_int][0] == a_id_int
-        )
-        threshold_pass = (
-            float(overlap_fraction) >= min_smaller_overlap
-            or float(pair_iou) >= min_iou
-        )
-        if not reciprocal or not threshold_pass:
-            continue
-        links.append(
-            {
-                "projection_a": projection_a,
-                "label_a": a_id_int,
-                "projection_b": projection_a + 1,
-                "label_b": b_id_int,
-                "intersection_pixels": int(intersection),
-                "smaller_overlap_fraction": float(overlap_fraction),
-                "iou": float(pair_iou),
-            }
-        )
-    return links
-
-
-def build_linked_cells(
-    label_files: Sequence[Path],
-    min_smaller_overlap: float,
-    min_iou: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[tuple[int, int], int]]:
-    """Create global cell IDs and exportable node/link tables."""
-
-    union_find = UnionFind()
-    node_rows: list[dict[str, int]] = []
-    link_rows: list[dict[str, float | int]] = []
-
-    previous: np.ndarray | None = None
-    for projection, path in enumerate(label_files):
-        labels = read_label(path)
-        areas = label_areas(labels)
-        for local_label in range(1, len(areas)):
-            if areas[local_label] == 0:
-                continue
-            node = (projection, local_label)
-            union_find.add(node)
-            node_rows.append(
-                {
-                    "projection": projection,
-                    "local_label": local_label,
-                    "nuclear_area_pixels": int(areas[local_label]),
-                }
-            )
-
-        if previous is not None:
-            links = reciprocal_best_links(
-                previous,
-                labels,
-                projection_a=projection - 1,
-                min_smaller_overlap=min_smaller_overlap,
-                min_iou=min_iou,
-            )
-            link_rows.extend(links)
-            for link in links:
-                union_find.union(
-                    (int(link["projection_a"]), int(link["label_a"])),
-                    (int(link["projection_b"]), int(link["label_b"])),
-                )
-        previous = labels
-
-    roots = sorted({union_find.find(node) for node in union_find.parent})
-    root_to_cell = {root: index + 1 for index, root in enumerate(roots)}
-    node_to_cell = {
-        node: root_to_cell[union_find.find(node)] for node in union_find.parent
-    }
-
-    node_df = pd.DataFrame(node_rows)
-    node_df["global_cell_id"] = [
-        node_to_cell[(int(row.projection), int(row.local_label))]
-        for row in node_df.itertuples(index=False)
-    ]
-    link_df = pd.DataFrame(
-        link_rows,
-        columns=[
-            "projection_a",
-            "label_a",
-            "projection_b",
-            "label_b",
-            "intersection_pixels",
-            "smaller_overlap_fraction",
-            "iou",
-        ],
-    )
-    return node_df, link_df, node_to_cell
-
-
-def load_spots(path: Path) -> np.ndarray:
-    spots = np.asarray(np.load(path, allow_pickle=False))
-    if spots.ndim != 2 or spots.shape[1] < 3:
-        raise ValueError(
-            f"Expected spot coordinates with shape (n, >=3) at {path}; "
-            f"got {spots.shape}"
-        )
-    coordinates = spots[:, [0, -2, -1]].astype(np.float64, copy=False)
-    if not np.all(np.isfinite(coordinates)):
-        raise ValueError(f"Spot coordinates contain NaN/inf values: {path}")
-    return coordinates
+    name, gene, root, x_nm, y_nm, z_nm = (part.strip() for part in parts)
+    try:
+        voxel = (float(x_nm), float(y_nm), float(z_nm))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Voxel sizes must be numeric") from exc
+    if any(v <= 0 for v in voxel):
+        raise argparse.ArgumentTypeError("Voxel sizes must be positive")
+    return ExperimentSpec(name, gene, Path(root), voxel)
 
 
 def parse_condition(condition: str) -> tuple[float | None, str]:
     normalized = condition.lower().replace("-", "_").replace(" ", "_")
-    time_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)", normalized)
-    time_hours = float(time_match.group(1)) if time_match else None
-
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)", normalized)
+    time_hours = float(match.group(1)) if match else None
     if "held" in normalized or "hold_open" in normalized or "holdopen" in normalized:
         injury = "held_open"
     elif "amputation" in normalized or "amput" in normalized:
@@ -546,152 +174,6 @@ def parse_condition(condition: str) -> tuple[float | None, str]:
     return time_hours, injury
 
 
-def assign_spots_to_linked_cells(
-    sample: SampleSpec,
-    label_files: Sequence[Path],
-    node_df: pd.DataFrame,
-    node_to_cell: dict[tuple[int, int], int],
-    projection_size: int,
-    expansion_distance: float,
-    save_assignment_maps: bool,
-    sample_output_dir: Path,
-) -> tuple[pd.DataFrame, dict[str, object]]:
-    """Expand original labels once and count spots by linked global cell."""
-
-    spot_file = locate_spot_file(sample.results_dir)
-    spots = load_spots(spot_file)
-    projection_indices = np.floor_divide(spots[:, 0].astype(np.int64), projection_size)
-    y_coordinates = np.rint(spots[:, 1]).astype(np.int64)
-    x_coordinates = np.rint(spots[:, 2]).astype(np.int64)
-
-    global_cell_count = int(node_df["global_cell_id"].max()) if not node_df.empty else 0
-    counts = np.zeros(global_cell_count + 1, dtype=np.int64)
-    background_spots = 0
-    invalid_spots = 0
-    assigned_spots = 0
-
-    map_dir = sample_output_dir / "assignment_maps"
-    if save_assignment_maps:
-        map_dir.mkdir(parents=True, exist_ok=True)
-
-    for projection, label_path in enumerate(label_files):
-        original_labels = read_label(label_path)
-        expanded = expand_labels(original_labels, distance=expansion_distance)
-
-        local_to_global = np.zeros(int(original_labels.max()) + 1, dtype=np.int64)
-        projection_nodes = node_df[node_df["projection"] == projection]
-        for row in projection_nodes.itertuples(index=False):
-            local_to_global[int(row.local_label)] = int(row.global_cell_id)
-
-        spot_mask = projection_indices == projection
-        ys = y_coordinates[spot_mask]
-        xs = x_coordinates[spot_mask]
-        valid = (
-            (ys >= 0)
-            & (ys < expanded.shape[0])
-            & (xs >= 0)
-            & (xs < expanded.shape[1])
-        )
-        invalid_spots += int(np.sum(~valid))
-        ys = ys[valid]
-        xs = xs[valid]
-
-        local_labels = expanded[ys, xs].astype(np.int64, copy=False)
-        background_spots += int(np.sum(local_labels == 0))
-        foreground = local_labels > 0
-        if np.any(foreground):
-            global_ids = local_to_global[local_labels[foreground]]
-            if np.any(global_ids == 0):
-                raise RuntimeError(
-                    f"An expanded label lacked a global mapping in {sample.sample_id}, "
-                    f"projection {projection}"
-                )
-            counts += np.bincount(global_ids, minlength=len(counts))
-            assigned_spots += int(len(global_ids))
-
-    out_of_projection_spots = int(
-        np.sum((projection_indices < 0) | (projection_indices >= len(label_files)))
-    )
-    invalid_spots += out_of_projection_spots
-
-    # Write maps only after all projections have been assigned, so every
-    # projection displays the final summed count for cells linked across z.
-    if save_assignment_maps:
-        for projection, label_path in enumerate(label_files):
-            original_labels = read_label(label_path)
-            expanded = expand_labels(original_labels, distance=expansion_distance)
-            local_to_global = np.zeros(int(original_labels.max()) + 1, dtype=np.int64)
-            projection_nodes = node_df[node_df["projection"] == projection]
-            for row in projection_nodes.itertuples(index=False):
-                local_to_global[int(row.local_label)] = int(row.global_cell_id)
-            expanded_global = local_to_global[expanded]
-            # Store transcript counts, not cell IDs. uint32 prevents the uint8
-            # overflow present in the legacy assignment-map implementation.
-            count_map = counts[expanded_global].astype(np.uint32, copy=False)
-            imwrite(
-                map_dir / f"assignment_count_map_{projection:03d}.tif",
-                count_map,
-                photometric="minisblack",
-            )
-
-    component_summary = (
-        node_df.groupby("global_cell_id", as_index=False)
-        .agg(
-            first_projection=("projection", "min"),
-            last_projection=("projection", "max"),
-            n_projections=("projection", "nunique"),
-            summed_nuclear_area_pixels=("nuclear_area_pixels", "sum"),
-        )
-        .sort_values("global_cell_id")
-    )
-    component_summary["transcript_count"] = counts[1:]
-    component_summary["responding"] = component_summary["transcript_count"] > 0
-    component_summary.insert(0, "sample_id", sample.sample_id)
-    component_summary.insert(0, "animal", sample.animal)
-    component_summary.insert(0, "condition", sample.condition)
-    component_summary.insert(0, "gene", sample.gene)
-    component_summary.insert(0, "experiment", sample.experiment)
-    time_hours, injury = parse_condition(sample.condition)
-    component_summary.insert(3, "time_hours", time_hours)
-    component_summary.insert(4, "injury", injury)
-
-    total_spots = int(len(spots))
-    accounted = assigned_spots + background_spots + invalid_spots
-    qc = {
-        "experiment": sample.experiment,
-        "gene": sample.gene,
-        "condition": sample.condition,
-        "time_hours": time_hours,
-        "injury": injury,
-        "animal": sample.animal,
-        "sample_id": sample.sample_id,
-        "sample_path": str(sample.sample_dir),
-        "spot_file": str(spot_file),
-        "label_projections": len(label_files),
-        "total_spots": total_spots,
-        "assigned_spots": assigned_spots,
-        "background_spots": background_spots,
-        "invalid_spots": invalid_spots,
-        "accounted_spots": accounted,
-        "spot_accounting_matches": accounted == total_spots,
-        "total_linked_cells": int(len(component_summary)),
-        "responding_cells": int(component_summary["responding"].sum()),
-        "responding_fraction": float(component_summary["responding"].mean())
-        if len(component_summary)
-        else math.nan,
-        "maximum_transcript_count": int(component_summary["transcript_count"].max())
-        if len(component_summary)
-        else 0,
-        "cells_spanning_multiple_projections": int(
-            np.sum(component_summary["n_projections"] > 1)
-        ),
-        "cells_spanning_more_than_three_projections": int(
-            np.sum(component_summary["n_projections"] > 3)
-        ),
-    }
-    return component_summary, qc
-
-
 def atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -699,322 +181,980 @@ def atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
     temporary.replace(path)
 
 
-def write_sample_outputs(
-    sample_output_dir: Path,
-    cell_df: pd.DataFrame,
-    node_df: pd.DataFrame,
-    link_df: pd.DataFrame,
-    qc: dict[str, object],
-) -> None:
-    sample_output_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_csv(cell_df, sample_output_dir / "cell_counts.csv")
-    atomic_write_csv(node_df, sample_output_dir / "projection_label_to_cell.csv")
-    atomic_write_csv(link_df, sample_output_dir / "adjacent_projection_links.csv")
-    with (sample_output_dir / "sample_qc.json").open("w", encoding="utf-8") as stream:
-        json.dump(qc, stream, indent=2, allow_nan=True)
+def atomic_write_json(data: object, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2, allow_nan=True)
+    temporary.replace(path)
 
 
-def animal_summary_from_cells(cell_df: pd.DataFrame) -> dict[str, object]:
-    first = cell_df.iloc[0]
-    positive = cell_df.loc[cell_df["transcript_count"] > 0, "transcript_count"].to_numpy()
-    return {
-        "experiment": first["experiment"],
-        "gene": first["gene"],
-        "condition": first["condition"],
-        "time_hours": first["time_hours"],
-        "injury": first["injury"],
-        "animal": first["animal"],
-        "sample_id": first["sample_id"],
-        "total_cells": int(len(cell_df)),
-        "responding_cells": int(len(positive)),
-        "responding_fraction": float(len(positive) / len(cell_df)) if len(cell_df) else math.nan,
-        "total_assigned_transcripts": int(np.sum(positive)) if len(positive) else 0,
-        "mean_count_all_cells": float(cell_df["transcript_count"].mean()),
-        "mean_log1p_all_cells": float(np.log1p(cell_df["transcript_count"]).mean()),
-        "mean_count_responding_cells": float(np.mean(positive)) if len(positive) else math.nan,
-        "median_count_responding_cells": float(np.median(positive)) if len(positive) else math.nan,
-        "mean_log1p_responding_cells": float(np.log1p(positive).mean())
-        if len(positive)
-        else math.nan,
-        "fraction_responding_cells_ge_5": float(np.mean(positive >= 5))
-        if len(positive)
-        else math.nan,
-        "maximum_count": int(np.max(positive)) if len(positive) else 0,
+def read_label(path: Path) -> np.ndarray:
+    if tifffile_imread is not None:
+        labels = np.asarray(tifffile_imread(path))
+    else:
+        from PIL import Image
+        labels = np.asarray(Image.open(path))
+    labels = np.squeeze(labels)
+    if labels.ndim != 2:
+        raise ValueError(f"Expected 2-D labels at {path}; got {labels.shape}")
+    if not np.issubdtype(labels.dtype, np.integer) and not np.all(labels == np.floor(labels)):
+        raise TypeError(f"Non-integer labels at {path}")
+    labels = labels.astype(np.int64, copy=False)
+    if np.any(labels < 0):
+        raise ValueError(f"Negative labels at {path}")
+    return labels
+
+
+def label_plane_index(path: Path) -> int:
+    match = LABEL_INDEX_PATTERN.search(path.stem)
+    if match is None:
+        raise ValueError(f"Cannot parse z index from {path.name}")
+    return int(match.group(1))
+
+
+def discover_samples(experiment: ExperimentSpec, channel_folder: str) -> list[SampleSpec]:
+    if not experiment.root.exists():
+        LOGGER.warning("Experiment root does not exist; skipping: %s", experiment.root)
+        return []
+    samples = []
+    for results_dir in experiment.root.rglob("results"):
+        if not results_dir.is_dir() or results_dir.parent.name != channel_folder:
+            continue
+        sample_dir = results_dir.parent.parent
+        condition_dir = sample_dir.parent
+        if condition_dir.parent.name.lower() != "experiment":
+            continue
+        samples.append(SampleSpec(experiment, condition_dir.name, sample_dir.name,
+                                  sample_dir, results_dir))
+    unique = {sample.results_dir.resolve(): sample for sample in samples}
+    return sorted(unique.values(),
+                  key=lambda s: (natural_key(s.condition), natural_key(s.animal)))
+
+
+def locate_cleaned_label_files(sample: SampleSpec, dirname: str) -> tuple[Path, list[Path]]:
+    label_dir = sample.results_dir / dirname
+    if not label_dir.is_dir():
+        raise FileNotFoundError(f"Cleaned Cellpose label directory is missing: {label_dir}")
+    summary_path = label_dir / "cleaning_summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"Cleaning completion record is missing: {summary_path}")
+    with summary_path.open(encoding="utf-8") as stream:
+        summary = json.load(stream)
+    if summary.get("status") != "completed":
+        raise RuntimeError(f"Cleaned label stack is not completed: {summary_path}")
+    files = sorted(label_dir.glob("Nucleus_Labels_*.tif*"), key=natural_key)
+    if not files:
+        raise FileNotFoundError(f"No cleaned label TIFFs in {label_dir}")
+    indices = [label_plane_index(path) for path in files]
+    if indices != list(range(indices[0], indices[0] + len(indices))):
+        raise ValueError(f"Cleaned label z indices are not contiguous in {label_dir}")
+    expected = read_label(files[0]).shape
+    for path in files[1:]:
+        if read_label(path).shape != expected:
+            raise ValueError(f"Cleaned label shape mismatch: {path}")
+    return label_dir, files
+
+
+def locate_spot_file(results_dir: Path) -> Path:
+    for name in ("spots_post_decomposition_and_background_removed.npy",
+                 "spots_post_decomposition.npy"):
+        path = results_dir / name
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"No final spot NPY found in {results_dir}")
+
+
+def load_spots(path: Path) -> np.ndarray:
+    spots = np.asarray(np.load(path, allow_pickle=False))
+    if spots.ndim != 2 or spots.shape[1] < 3:
+        raise ValueError(f"Expected spots shaped (n, >=3) at {path}; got {spots.shape}")
+    coordinates = spots[:, [0, -2, -1]].astype(np.float64, copy=False)
+    if not np.all(np.isfinite(coordinates)):
+        raise ValueError(f"Spot coordinates contain NaN/inf: {path}")
+    return coordinates
+
+
+def locate_raw_smfish_file(sample: SampleSpec) -> Path:
+    candidates = [path for path in sample.results_dir.parent.glob("*.tif*")
+                  if path.is_file() and not path.name.startswith("._")]
+    if not candidates:
+        raise FileNotFoundError(f"No raw smFISH TIFF in {sample.results_dir.parent}")
+    def score(path: Path) -> tuple[int, int, str]:
+        name = path.name.lower()
+        match_score = sum(token.lower() in name for token in
+                          (sample.condition, sample.animal, sample.experiment.gene, "565"))
+        return match_score, path.stat().st_size, path.name
+    return max(candidates, key=score)
+
+
+def update_cell_accumulators(accumulators: dict[int, CellAccumulator],
+                             labels: np.ndarray, z_index: int) -> None:
+    ys, xs = np.nonzero(labels)
+    if not len(ys):
+        return
+    ids = labels[ys, xs].astype(np.int64, copy=False)
+    length = int(ids.max()) + 1
+    counts = np.bincount(ids, minlength=length)
+    sums_y = np.bincount(ids, weights=ys, minlength=length)
+    sums_x = np.bincount(ids, weights=xs, minlength=length)
+    for cell_id in np.flatnonzero(counts[1:]) + 1:
+        area = int(counts[cell_id])
+        acc = accumulators.setdefault(int(cell_id), CellAccumulator())
+        acc.voxel_count += area
+        acc.sum_z += z_index * area
+        acc.sum_y += float(sums_y[cell_id])
+        acc.sum_x += float(sums_x[cell_id])
+        acc.first_z = min(acc.first_z, z_index)
+        acc.last_z = max(acc.last_z, z_index)
+        acc.n_z_planes += 1
+        if area > acc.max_cross_section_pixels:
+            acc.max_cross_section_pixels = area
+            acc.example_z = z_index
+            acc.example_y = float(sums_y[cell_id] / area)
+            acc.example_x = float(sums_x[cell_id] / area)
+
+
+def assign_spots_nearest_3d(sample: SampleSpec, label_files: Sequence[Path],
+                            spots: np.ndarray
+                            ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object], np.ndarray]:
+    """Exact nearest discrete nuclear voxel, streamed one z-plane at a time."""
+    height, width = read_label(label_files[0]).shape
+    z_indices = np.asarray([label_plane_index(path) for path in label_files], float)
+    z_min, z_max = float(z_indices.min()), float(z_indices.max())
+    z_um, y_um, x_um = sample.experiment.voxel_zyx_um
+    spot_z, spot_y, spot_x = spots[:, 0], spots[:, 1], spots[:, 2]
+    valid_xy = ((spot_y >= 0) & (spot_y <= height - 1) &
+                (spot_x >= 0) & (spot_x <= width - 1))
+    valid_z = (spot_z >= z_min) & (spot_z <= z_max)
+    valid = valid_xy & valid_z
+    query_y = np.clip(np.rint(spot_y[valid]).astype(np.int64), 0, height - 1)
+    query_x = np.clip(np.rint(spot_x[valid]).astype(np.int64), 0, width - 1)
+    n_valid = int(valid.sum())
+    best_distance = np.full(n_valid, np.inf)
+    best_cell = np.zeros(n_valid, dtype=np.int64)
+    best_z = np.full(n_valid, -1, dtype=np.int64)
+    best_y = np.full(n_valid, -1, dtype=np.int64)
+    best_x = np.full(n_valid, -1, dtype=np.int64)
+    accumulators: dict[int, CellAccumulator] = {}
+    planes_with_nuclei = 0
+    for position, label_path in enumerate(label_files):
+        labels = read_label(label_path)
+        z_index = label_plane_index(label_path)
+        update_cell_accumulators(accumulators, labels, z_index)
+        if not np.any(labels > 0):
+            continue
+        planes_with_nuclei += 1
+        nearest = ndimage.distance_transform_edt(
+            labels == 0, sampling=(y_um, x_um),
+            return_distances=False, return_indices=True,
+        )
+        nearest_y = nearest[0, query_y, query_x]
+        nearest_x = nearest[1, query_y, query_x]
+        candidate_cell = labels[nearest_y, nearest_x].astype(np.int64, copy=False)
+        dy = (spot_y[valid] - nearest_y) * y_um
+        dx = (spot_x[valid] - nearest_x) * x_um
+        dz = (spot_z[valid] - z_index) * z_um
+        candidate_distance = np.sqrt(dx * dx + dy * dy + dz * dz)
+        better = candidate_distance < best_distance - 1e-12
+        tie = np.isclose(candidate_distance, best_distance, rtol=0, atol=1e-12)
+        tie &= (best_cell == 0) | (candidate_cell < best_cell)
+        choose = better | tie
+        best_distance[choose] = candidate_distance[choose]
+        best_cell[choose] = candidate_cell[choose]
+        best_z[choose] = z_index
+        best_y[choose] = nearest_y[choose]
+        best_x[choose] = nearest_x[choose]
+        LOGGER.info("%s | nearest 3-D pass %d/%d z=%d", sample.sample_id,
+                    position + 1, len(label_files), z_index)
+    if not accumulators or not planes_with_nuclei:
+        raise RuntimeError(f"No cleaned nuclei remain in {sample.sample_id}")
+    if np.any(best_cell == 0):
+        raise RuntimeError(f"Valid spots could not be assigned in {sample.sample_id}")
+    assigned_cell = np.zeros(len(spots), dtype=np.int64)
+    nearest_z = np.full(len(spots), -1, dtype=np.int64)
+    nearest_y_all = np.full(len(spots), -1, dtype=np.int64)
+    nearest_x_all = np.full(len(spots), -1, dtype=np.int64)
+    distance_all = np.full(len(spots), np.nan)
+    assigned_cell[valid], nearest_z[valid] = best_cell, best_z
+    nearest_y_all[valid], nearest_x_all[valid] = best_y, best_x
+    distance_all[valid] = best_distance
+    counts = np.bincount(assigned_cell[valid],
+                         minlength=max(max(accumulators), int(assigned_cell.max())) + 1)
+    time_hours, injury = parse_condition(sample.condition)
+    rows = []
+    for cell_id in sorted(accumulators):
+        acc = accumulators[cell_id]
+        count = int(counts[cell_id]) if cell_id < len(counts) else 0
+        rows.append({
+            "experiment": sample.experiment.name, "gene": sample.experiment.gene,
+            "condition": sample.condition, "time_hours": time_hours, "injury": injury,
+            "animal": sample.animal, "sample_id": sample.sample_id,
+            "replicate_name": sample.replicate_name, "global_cell_id": cell_id,
+            "first_z": acc.first_z, "last_z": acc.last_z,
+            "n_z_planes": acc.n_z_planes, "nuclear_voxel_count": acc.voxel_count,
+            "max_cross_section_pixels": acc.max_cross_section_pixels,
+            "centroid_z": acc.sum_z / acc.voxel_count,
+            "centroid_y": acc.sum_y / acc.voxel_count,
+            "centroid_x": acc.sum_x / acc.voxel_count,
+            "example_z": acc.example_z, "example_y": acc.example_y,
+            "example_x": acc.example_x, "transcript_count": count,
+            "responding": count > 0,
+        })
+    cell_df = pd.DataFrame(rows)
+    spot_df = pd.DataFrame({
+        "experiment": sample.experiment.name, "condition": sample.condition,
+        "animal": sample.animal, "sample_id": sample.sample_id,
+        "spot_index": np.arange(len(spots)), "spot_z": spot_z, "spot_y": spot_y,
+        "spot_x": spot_x, "coordinate_valid": valid,
+        "assigned_cell_id": assigned_cell, "nearest_nucleus_z": nearest_z,
+        "nearest_nucleus_y": nearest_y_all, "nearest_nucleus_x": nearest_x_all,
+        "assignment_distance_um": distance_all,
+    })
+    distances = distance_all[valid]
+    mean_distance = float(np.mean(distances)) if len(distances) else math.nan
+    median_distance = float(np.median(distances)) if len(distances) else math.nan
+    p95_distance = float(np.percentile(distances, 95)) if len(distances) else math.nan
+    maximum_distance = float(np.max(distances)) if len(distances) else math.nan
+    qc = {
+        "experiment": sample.experiment.name, "gene": sample.experiment.gene,
+        "condition": sample.condition, "time_hours": time_hours, "injury": injury,
+        "animal": sample.animal, "sample_id": sample.sample_id,
+        "sample_path": str(sample.sample_dir),
+        "voxel_xyz_nm": list(sample.experiment.voxel_xyz_nm),
+        "label_planes": len(label_files), "label_z_min": int(z_min),
+        "label_z_max": int(z_max), "label_shape_yx": [height, width],
+        "total_cleaned_cells": len(cell_df), "total_spots": len(spots),
+        "assigned_spots": int(valid.sum()), "invalid_xy_spots": int((~valid_xy).sum()),
+        "invalid_z_spots": int((valid_xy & ~valid_z).sum()),
+        "unassigned_valid_spots": int(np.sum(valid & (assigned_cell == 0))),
+        "spot_accounting_matches": int(valid.sum() + (~valid).sum()) == len(spots),
+        "responding_cells": int(cell_df["responding"].sum()),
+        "responding_fraction": float(cell_df["responding"].mean()),
+        "maximum_transcript_count": int(cell_df["transcript_count"].max()),
+        "mean_assignment_distance_um": mean_distance,
+        "median_assignment_distance_um": median_distance,
+        "p95_assignment_distance_um": p95_distance,
+        "maximum_assignment_distance_um": maximum_distance,
+        "fraction_assignment_distance_gt_5um": (
+            float(np.mean(distances > 5)) if len(distances) else math.nan),
+        "fraction_assignment_distance_gt_10um": (
+            float(np.mean(distances > 10)) if len(distances) else math.nan),
+        "fraction_assignment_distance_gt_20um": (
+            float(np.mean(distances > 20)) if len(distances) else math.nan),
     }
+    return cell_df, spot_df, qc, counts.astype(np.int64)
 
 
-def process_sample(
-    sample: SampleSpec,
-    parameters: Parameters,
-    output_root: Path,
-    overwrite: bool,
-) -> tuple[pd.DataFrame, dict[str, object], pd.DataFrame, pd.DataFrame]:
-    sample_output_dir = output_root / sample.experiment / sample.condition / sample.animal
-    completion_marker = sample_output_dir / "COMPLETE.json"
-    if completion_marker.exists() and not overwrite:
-        LOGGER.info("Skipping completed sample: %s", sample.sample_id)
-        cell_df = pd.read_csv(sample_output_dir / "cell_counts.csv")
-        node_df = pd.read_csv(sample_output_dir / "projection_label_to_cell.csv")
-        link_df = pd.read_csv(sample_output_dir / "adjacent_projection_links.csv")
-        with (sample_output_dir / "sample_qc.json").open(encoding="utf-8") as stream:
-            qc = json.load(stream)
-        return cell_df, qc, node_df, link_df
-
-    if sample_output_dir.exists() and overwrite:
-        shutil.rmtree(sample_output_dir)
-    sample_output_dir.mkdir(parents=True, exist_ok=True)
-
-    LOGGER.info("Processing %s", sample.sample_id)
-    label_files = locate_label_files(sample.results_dir)
-    validate_label_sequence(label_files)
-    node_df, link_df, node_to_cell = build_linked_cells(
-        label_files,
-        min_smaller_overlap=parameters.min_smaller_overlap,
-        min_iou=parameters.min_iou,
-    )
-    cell_df, qc = assign_spots_to_linked_cells(
-        sample,
-        label_files,
-        node_df,
-        node_to_cell,
-        projection_size=parameters.projection_size,
-        expansion_distance=parameters.expansion_distance,
-        save_assignment_maps=parameters.save_assignment_maps,
-        sample_output_dir=sample_output_dir,
-    )
-    write_sample_outputs(sample_output_dir, cell_df, node_df, link_df, qc)
-    with completion_marker.open("w", encoding="utf-8") as stream:
-        json.dump(
-            {
-                "script_version": SCRIPT_VERSION,
-                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-                "parameters": asdict(parameters),
-            },
-            stream,
-            indent=2,
+def write_tiff_stack(path: Path, planes: Iterable[np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    if TiffWriter is not None:
+        with TiffWriter(temporary, bigtiff=True) as writer:
+            for plane in planes:
+                writer.write(np.asarray(plane, dtype=np.uint32), photometric="minisblack",
+                             compression="zlib")
+    else:
+        from PIL import Image
+        images = [Image.fromarray(np.asarray(plane, dtype=np.uint32)) for plane in planes]
+        if not images:
+            raise ValueError("Cannot write empty TIFF stack")
+        images[0].save(
+            temporary,
+            format="TIFF",
+            save_all=True,
+            append_images=images[1:],
         )
-    return cell_df, qc, node_df, link_df
+    temporary.replace(path)
 
 
-def aggregate_outputs(
-    cell_frames: Sequence[pd.DataFrame],
-    qc_rows: Sequence[dict[str, object]],
-    output_root: Path,
-) -> None:
-    if not cell_frames:
-        raise RuntimeError("No samples were successfully processed")
-
-    all_cells = pd.concat(cell_frames, ignore_index=True)
-    atomic_write_csv(all_cells, output_root / "all_cells_long.csv")
-
-    positive_series: dict[str, pd.Series] = {}
-    animal_rows: list[dict[str, object]] = []
-    for sample_id, sample_cells in all_cells.groupby("sample_id", sort=True):
-        positive = sample_cells.loc[
-            sample_cells["transcript_count"] > 0, "transcript_count"
-        ].reset_index(drop=True)
-        positive_series[str(sample_id)] = positive
-        animal_rows.append(animal_summary_from_cells(sample_cells))
-
-    positive_wide = pd.DataFrame(positive_series)
-    atomic_write_csv(positive_wide, output_root / "positive_cells_wide.csv")
-    atomic_write_csv(pd.DataFrame(animal_rows), output_root / "animal_summary.csv")
-    atomic_write_csv(pd.DataFrame(qc_rows), output_root / "sample_qc.csv")
+def write_assignment_count_map(label_files: Sequence[Path], counts: np.ndarray,
+                               path: Path) -> None:
+    max_label = max(int(read_label(label_path).max()) for label_path in label_files)
+    if max_label >= len(counts):
+        counts = np.pad(counts, (0, max_label + 1 - len(counts)))
+    write_tiff_stack(path, (counts[read_label(label_path)].astype(np.uint32, copy=False)
+                            for label_path in label_files))
 
 
-def run_pipeline(
-    experiments: Sequence[ExperimentSpec],
-    parameters: Parameters,
-    output_root: Path,
-    overwrite: bool,
-    fail_fast: bool,
-    sample_regex: str | None,
-) -> int:
-    output_root.mkdir(parents=True, exist_ok=True)
-    with (output_root / "run_configuration.json").open("w", encoding="utf-8") as stream:
-        json.dump(
-            {
-                "script_version": SCRIPT_VERSION,
-                "started_at_utc": datetime.now(timezone.utc).isoformat(),
-                "experiments": [
-                    {"name": item.name, "gene": item.gene, "root": str(item.root)}
-                    for item in experiments
-                ],
-                "parameters": asdict(parameters),
-            },
-            stream,
-            indent=2,
-        )
+def stable_rng(sample_id: str, seed: int) -> np.random.Generator:
+    digest = hashlib.sha256(f"{seed}|{sample_id}".encode()).digest()
+    return np.random.default_rng(int.from_bytes(digest[:8], "little"))
 
-    pattern = re.compile(sample_regex) if sample_regex else None
-    all_samples: list[SampleSpec] = []
-    for experiment in experiments:
-        discovered = discover_samples(experiment, parameters.channel_folder)
-        LOGGER.info("Discovered %d samples for experiment %s", len(discovered), experiment.name)
-        all_samples.extend(discovered)
-    if pattern:
-        all_samples = [sample for sample in all_samples if pattern.search(sample.sample_id)]
-        LOGGER.info("%d samples remain after --sample-regex", len(all_samples))
-    if not all_samples:
-        LOGGER.error("No samples discovered. Check roots and --channel-folder.")
-        return 2
 
-    cell_frames: list[pd.DataFrame] = []
-    qc_rows: list[dict[str, object]] = []
-    errors: list[dict[str, str]] = []
-    for sample in all_samples:
+def choose_example_cell(cell_df: pd.DataFrame,
+                        rng: np.random.Generator) -> tuple[pd.Series, str]:
+    eligible = cell_df[cell_df["transcript_count"] > 10]
+    rule = "random_expression_gt_10"
+    if eligible.empty:
+        eligible = cell_df[cell_df["transcript_count"] == cell_df["transcript_count"].max()]
+        rule = "random_maximum_expression"
+    return eligible.iloc[int(rng.integers(0, len(eligible)))], rule
+
+
+def crop_bounds(center: float, size: int, length: int) -> tuple[int, int]:
+    if length <= size:
+        return 0, length
+    start = max(0, min(int(round(center)) - size // 2, length - size))
+    return start, start + size
+
+
+def normalize_raw_stack(array: np.ndarray, label_shape: tuple[int, int]) -> np.ndarray:
+    raw = np.squeeze(np.asarray(array))
+    if raw.ndim == 2:
+        if raw.shape != label_shape:
+            raise ValueError(f"Raw shape {raw.shape} != label shape {label_shape}")
+        return raw[np.newaxis]
+    if raw.ndim != 3:
+        raise ValueError(f"Expected 2-D/3-D raw TIFF; got {raw.shape}")
+    height, width = label_shape
+    for z_axis in range(3):
+        other = [axis for axis in range(3) if axis != z_axis]
+        y_axis, x_axis = other
+        if raw.shape[y_axis] == height and raw.shape[x_axis] == width:
+            return np.moveaxis(raw, (z_axis, y_axis, x_axis), (0, 1, 2))
+        if raw.shape[y_axis] == width and raw.shape[x_axis] == height:
+            return np.moveaxis(raw, (z_axis, y_axis, x_axis), (0, 1, 2)).swapaxes(1, 2)
+    raise ValueError(f"Cannot align raw shape {raw.shape} to labels {label_shape}")
+
+
+def raw_crop_max_projection(raw_path: Path, label_shape: tuple[int, int],
+                            y_slice: slice, x_slice: slice) -> np.ndarray:
+    height, width = label_shape
+    if TiffFile is not None:
+        with TiffFile(raw_path) as tif:
+            series = tif.series[0]
+            pages = list(series.pages)
+            if pages and all(tuple(page.shape) == (height, width) for page in pages):
+                projection = None
+                for page in pages:
+                    crop = np.asarray(page.asarray())[y_slice, x_slice]
+                    projection = crop.copy() if projection is None else np.maximum(projection, crop)
+                if projection is None:
+                    raise ValueError(f"No TIFF pages in {raw_path}")
+                return projection
+            raw = normalize_raw_stack(series.asarray(), label_shape)
+            return np.max(raw[:, y_slice, x_slice], axis=0)
+    from PIL import Image
+    image = Image.open(raw_path)
+    projection = None
+    frame = 0
+    while True:
         try:
-            cell_df, qc, _, _ = process_sample(
-                sample,
-                parameters=parameters,
-                output_root=output_root,
-                overwrite=overwrite,
-            )
-            cell_frames.append(cell_df)
-            qc_rows.append(qc)
-        except Exception as exc:  # keep the batch running unless requested otherwise
-            LOGGER.exception("Failed sample %s", sample.sample_id)
-            errors.append(
-                {
-                    "sample_id": sample.sample_id,
-                    "sample_path": str(sample.sample_dir),
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-            )
-            if fail_fast:
-                break
+            image.seek(frame)
+        except EOFError:
+            break
+        array = np.asarray(image)
+        if array.shape != (height, width):
+            raw = normalize_raw_stack(array, label_shape)
+            return np.max(raw[:, y_slice, x_slice], axis=0)
+        crop = array[y_slice, x_slice]
+        projection = crop.copy() if projection is None else np.maximum(projection, crop)
+        frame += 1
+    if projection is None:
+        raise ValueError(f"No TIFF frames in {raw_path}")
+    return projection
 
-    if errors:
-        atomic_write_csv(pd.DataFrame(errors), output_root / "processing_errors.csv")
-    if cell_frames:
-        aggregate_outputs(cell_frames, qc_rows, output_root)
-    LOGGER.info(
-        "Finished: %d successful samples, %d failed samples. Output: %s",
-        len(cell_frames),
-        len(errors),
-        output_root,
-    )
-    return 1 if errors else 0
+
+def display_limits(image: np.ndarray) -> tuple[float, float]:
+    values = np.asarray(image, float)
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return 0.0, 1.0
+    low, high = np.percentile(values, (1, 99.8))
+    return float(low), float(high if high > low else low + 1)
+
+
+def label_rgb(labels: np.ndarray) -> np.ndarray:
+    rgb = np.zeros((*labels.shape, 3), dtype=np.float32)
+    for cell_id in np.unique(labels):
+        if not cell_id:
+            continue
+        digest = hashlib.sha256(str(int(cell_id)).encode()).digest()
+        color = np.asarray([64 + digest[0] % 192, 64 + digest[1] % 192,
+                            64 + digest[2] % 192]) / 255.0
+        rgb[labels == cell_id] = color
+    return rgb
+
+
+def outline(mask: np.ndarray) -> np.ndarray:
+    return mask & ~ndimage.binary_erosion(mask)
+
+
+def draw_raw(ax: plt.Axes, raw: np.ndarray, title: str) -> None:
+    vmin, vmax = display_limits(raw)
+    ax.imshow(raw, cmap="gray", vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    ax.set_axis_off()
+
+
+def save_single_panel(path: Path, draw: Callable[[plt.Axes], None]) -> None:
+    fig, ax = plt.subplots(figsize=(6, 6), constrained_layout=True)
+    draw(ax)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def create_example_images(sample: SampleSpec, label_files: Sequence[Path],
+                          cell_df: pd.DataFrame, spot_df: pd.DataFrame,
+                          counts: np.ndarray, example_dir: Path,
+                          parameters: Parameters) -> dict[str, object]:
+    example_dir.mkdir(parents=True, exist_ok=True)
+    rng = stable_rng(sample.sample_id, parameters.random_seed)
+    chosen, selection_rule = choose_example_cell(cell_df, rng)
+    selected_cell = int(chosen["global_cell_id"])
+    z_index = int(chosen["example_z"])
+    by_z = {label_plane_index(path): path for path in label_files}
+    labels_full = read_label(by_z[z_index])
+    height, width = labels_full.shape
+    y0, y1 = crop_bounds(float(chosen["example_y"]), parameters.crop_size, height)
+    x0, x1 = crop_bounds(float(chosen["example_x"]), parameters.crop_size, width)
+    labels = labels_full[y0:y1, x0:x1]
+    raw_path = locate_raw_smfish_file(sample)
+    raw = raw_crop_max_projection(raw_path, (height, width), slice(y0, y1), slice(x0, x1))
+    selected_outline = outline(labels == selected_cell)
+    all_nuclei_outline = outline(labels > 0)
+    if int(labels.max()) >= len(counts):
+        counts = np.pad(counts, (0, int(labels.max()) + 1 - len(counts)))
+    count_map = counts[labels]
+    visible = spot_df[
+        spot_df["coordinate_valid"] & spot_df["spot_y"].between(y0, y1 - 1) &
+        spot_df["spot_x"].between(x0, x1 - 1)
+    ].copy()
+    if len(visible) > parameters.max_link_lines:
+        positions = np.sort(rng.choice(len(visible), parameters.max_link_lines, replace=False))
+        visible_links = visible.iloc[positions]
+    else:
+        visible_links = visible
+
+    def add_outline(ax: plt.Axes) -> None:
+        yy, xx = np.nonzero(selected_outline)
+        ax.scatter(xx, yy, s=2, c="#00ffff", linewidths=0)
+
+    def draw_smfish(ax: plt.Axes) -> None:
+        draw_raw(ax, raw, "smFISH max projection")
+        add_outline(ax)
+
+    def draw_detection(ax: plt.Axes) -> None:
+        draw_raw(ax, raw, "smFISH detection")
+        ax.scatter(visible["spot_x"] - x0, visible["spot_y"] - y0, s=11,
+                   facecolors="none", edgecolors="#ff3030", linewidths=0.7)
+        add_outline(ax)
+
+    def draw_segmentation(ax: plt.Axes) -> None:
+        ax.imshow(label_rgb(labels))
+        ax.set_title(f"Cleaned nuclei segmentation, z={z_index}")
+        add_outline(ax)
+        ax.set_axis_off()
+
+    def draw_assignment(ax: plt.Axes) -> None:
+        positive = count_map[count_map > 0]
+        vmax = max(1, float(np.percentile(positive, 99))) if positive.size else 1
+        shown = ax.imshow(count_map, cmap="magma", vmin=0, vmax=vmax)
+        ax.set_title("Nuclei assignment-count map")
+        yy_all, xx_all = np.nonzero(all_nuclei_outline)
+        ax.scatter(xx_all, yy_all, s=0.35, c="#d0d0d0", linewidths=0, alpha=0.7)
+        add_outline(ax)
+        ax.set_axis_off()
+        plt.colorbar(shown, ax=ax, fraction=0.046, pad=0.04, label="spots / cell")
+
+    def draw_links(ax: plt.Axes) -> None:
+        draw_raw(ax, raw, "3-D spot-to-nearest-nucleus links")
+        for row in visible_links.itertuples(index=False):
+            color = "#00ffff" if int(row.assigned_cell_id) == selected_cell else "#ffd92f"
+            ax.plot([row.spot_x - x0, row.nearest_nucleus_x - x0],
+                    [row.spot_y - y0, row.nearest_nucleus_y - y0],
+                    color=color, linewidth=0.55, alpha=0.65)
+        ax.scatter(visible_links["spot_x"] - x0, visible_links["spot_y"] - y0,
+                   s=9, c="#ff3030", linewidths=0)
+        add_outline(ax)
+        ax.set_xlim(-0.5, raw.shape[1] - 0.5)
+        ax.set_ylim(raw.shape[0] - 0.5, -0.5)
+
+    panels = [
+        ("01_smFISH.png", draw_smfish),
+        ("02_smFISH_detection.png", draw_detection),
+        ("03_nuclei_segmentation.png", draw_segmentation),
+        ("04_nuclei_assignment_map.png", draw_assignment),
+        ("05_spot_to_nearest_nucleus_links.png", draw_links),
+    ]
+    for filename, draw in panels:
+        save_single_panel(example_dir / filename, draw)
+    fig, axes = plt.subplots(1, 5, figsize=(24, 5), constrained_layout=True)
+    for ax, (_, draw) in zip(axes, panels, strict=True):
+        draw(ax)
+    fig.suptitle(f"{sample.sample_id} | cell {selected_cell} | expression="
+                 f"{int(chosen['transcript_count'])}")
+    fig.savefig(example_dir / "00_example_overview.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    metadata = {
+        "sample_id": sample.sample_id, "condition": sample.condition,
+        "animal": sample.animal, "raw_smfish_file": str(raw_path),
+        "selected_cell_id": selected_cell,
+        "selected_cell_expression": int(chosen["transcript_count"]),
+        "selection_rule": selection_rule, "selected_z_plane": z_index,
+        "crop_y0_y1": [y0, y1], "crop_x0_x1": [x0, x1],
+        "crop_size_requested": parameters.crop_size,
+        "spots_visible_in_crop": len(visible), "links_drawn": len(visible_links),
+    }
+    atomic_write_json(metadata, example_dir / "example_metadata.json")
+    return metadata
+
+
+def plot_distance_qc(spot_df: pd.DataFrame, path: Path, sample_id: str) -> None:
+    values = spot_df.loc[spot_df["coordinate_valid"], "assignment_distance_um"].dropna()
+    fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
+    ax.hist(values, bins=50, color="#4c78a8", edgecolor="white", linewidth=0.3)
+    ax.set(xlabel="3-D distance to assigned nucleus (µm)", ylabel="spots", title=sample_id)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def sample_summary_from_cells(cell_df: pd.DataFrame) -> dict[str, object]:
+    first = cell_df.iloc[0]
+    counts = cell_df["transcript_count"].to_numpy(float)
+    nonzero = counts[counts > 0]
+    row = {
+        "experiment": first["experiment"], "gene": first["gene"],
+        "condition": first["condition"], "time_hours": first["time_hours"],
+        "injury": first["injury"], "animal": first["animal"],
+        "sample_id": first["sample_id"], "replicate_name": first["replicate_name"],
+        "total_cells": len(counts), "nonzero_cells": len(nonzero),
+        "percent_nonzero_cells": 100 * len(nonzero) / len(counts),
+        "total_assigned_spots": int(np.sum(counts)),
+        "mean_count_all_cells": float(np.mean(counts)),
+        "median_count_all_cells": float(np.median(counts)),
+        "mean_count_nonzero_cells": float(np.mean(nonzero)) if len(nonzero) else math.nan,
+        "median_count_nonzero_cells": float(np.median(nonzero)) if len(nonzero) else math.nan,
+        "maximum_count": int(np.max(counts)),
+    }
+    for threshold in THRESHOLDS:
+        row[f"percent_cells_gt_{threshold}"] = float(100 * np.mean(counts > threshold))
+    return row
+
+
+def wide_counts(all_cells: pd.DataFrame, nonzero_only: bool) -> pd.DataFrame:
+    columns = {}
+    ordered = all_cells.sort_values(["condition", "animal", "global_cell_id"])
+    for replicate, group in ordered.groupby("replicate_name", sort=False):
+        values = group["transcript_count"]
+        if nonzero_only:
+            values = values[values > 0]
+        columns[str(replicate)] = values.reset_index(drop=True)
+    return pd.DataFrame(columns)
+
+
+def welch_df(first: np.ndarray, second: np.ndarray) -> float:
+    if len(first) < 2 or len(second) < 2:
+        return math.nan
+    v1, v2 = np.var(first, ddof=1), np.var(second, ddof=1)
+    numerator = (v1 / len(first) + v2 / len(second)) ** 2
+    denominator = ((v1 / len(first)) ** 2 / (len(first) - 1) +
+                   (v2 / len(second)) ** 2 / (len(second) - 1))
+    return float(numerator / denominator) if denominator > 0 else math.nan
+
+
+def holm_adjust(p_values: Sequence[float]) -> list[float]:
+    result = np.full(len(p_values), np.nan)
+    finite = [i for i, value in enumerate(p_values) if np.isfinite(value)]
+    ordered = sorted(finite, key=lambda i: p_values[i])
+    previous = 0.0
+    for rank, index in enumerate(ordered):
+        adjusted = min(1.0, float(p_values[index]) * (len(ordered) - rank))
+        previous = max(previous, adjusted)
+        result[index] = previous
+    return result.tolist()
+
+
+def unpaired_ttests(summary: pd.DataFrame, metrics: Sequence[str]) -> pd.DataFrame:
+    rows = []
+    times = sorted(summary["time_hours"].dropna().unique())
+    for metric in metrics:
+        indices = []
+        for time_hours in times:
+            subset = summary[summary["time_hours"] == time_hours]
+            first = subset.loc[subset["injury"] == "incision", metric].dropna().to_numpy(float)
+            second = subset.loc[subset["injury"] == "amputation", metric].dropna().to_numpy(float)
+            statistic = p_value = math.nan
+            if len(first) >= 2 and len(second) >= 2:
+                variance_first = float(np.var(first, ddof=1))
+                variance_second = float(np.var(second, ddof=1))
+                if variance_first == 0 and variance_second == 0:
+                    difference = float(np.mean(first) - np.mean(second))
+                    statistic = 0.0 if difference == 0 else math.copysign(math.inf, difference)
+                    p_value = 1.0 if difference == 0 else 0.0
+                else:
+                    test = stats.ttest_ind(
+                        first, second, equal_var=False, alternative="two-sided"
+                    )
+                    statistic, p_value = float(test.statistic), float(test.pvalue)
+            rows.append({
+                "metric": metric, "time_hours": time_hours,
+                "group_1": "incision", "group_2": "amputation",
+                "n_group_1": len(first), "n_group_2": len(second),
+                "mean_group_1": float(np.mean(first)) if len(first) else math.nan,
+                "mean_group_2": float(np.mean(second)) if len(second) else math.nan,
+                "mean_difference_group_1_minus_group_2": (
+                    float(np.mean(first) - np.mean(second)) if len(first) and len(second)
+                    else math.nan),
+                "t_statistic": statistic, "welch_df": welch_df(first, second),
+                "p_value": p_value, "test": "two-sided unpaired Welch t-test",
+                "statistical_unit": "biological replicate / image",
+            })
+            indices.append(len(rows) - 1)
+        adjusted = holm_adjust([rows[index]["p_value"] for index in indices])
+        for index, value in zip(indices, adjusted, strict=True):
+            rows[index]["p_value_holm_across_times_for_metric"] = value
+    return pd.DataFrame(rows)
+
+
+def plot_biological_replicate_boxplots(summary: pd.DataFrame,
+                                       metrics: Sequence[str], titles: Sequence[str],
+                                       ylabels: Sequence[str], path: Path) -> None:
+    times = sorted(summary["time_hours"].dropna().unique())
+    injuries = [item for item in INJURY_ORDER if item in set(summary["injury"])]
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6.4 * len(metrics), 5),
+                             squeeze=False, constrained_layout=True)
+    offsets = np.linspace(-0.25, 0.25, max(1, len(injuries)))
+    rng = np.random.default_rng(20260831)
+    for panel, (metric, title, ylabel) in enumerate(zip(metrics, titles, ylabels, strict=True)):
+        ax = axes[0, panel]
+        handles = []
+        for injury_index, injury in enumerate(injuries):
+            color = INJURY_COLORS[injury]
+            for time_index, time_hours in enumerate(times):
+                values = summary.loc[(summary["injury"] == injury) &
+                                     (summary["time_hours"] == time_hours), metric].dropna().to_numpy(float)
+                if not len(values):
+                    continue
+                position = time_index + offsets[injury_index]
+                box = ax.boxplot([values], positions=[position], widths=0.22,
+                                 patch_artist=True, showfliers=False,
+                                 medianprops={"color": "black"})
+                box["boxes"][0].set_facecolor(color)
+                box["boxes"][0].set_alpha(0.42)
+                ax.scatter(np.full(len(values), position) + rng.uniform(-0.035, 0.035, len(values)),
+                           values, color=color, edgecolor="black", linewidth=0.35,
+                           s=34, zorder=3)
+            handles.append(plt.Line2D([0], [0], marker="o", color="none",
+                                      markerfacecolor=color, markeredgecolor="black",
+                                      label=injury))
+        ax.set_xticks(range(len(times)), [f"{time:g} h" for time in times])
+        ax.set(xlabel="time", ylabel=ylabel, title=title)
+        if handles:
+            ax.legend(handles=handles, frameon=False)
+        ax.spines[["top", "right"]].set_visible(False)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def dunn_tests(summary: pd.DataFrame, metrics: Sequence[str]
+               ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    omnibus_rows, pairwise_rows = [], []
+    for metric in metrics:
+        clean = summary[["condition", metric]].dropna()
+        grouped = [(str(name), group[metric].to_numpy(float))
+                   for name, group in clean.groupby("condition", sort=True) if len(group)]
+        if len(grouped) < 2:
+            omnibus_rows.append({"metric": metric, "n_groups": len(grouped),
+                                  "h_statistic": math.nan, "p_value": math.nan})
+            continue
+        arrays = [values for _, values in grouped]
+        all_values = np.concatenate(arrays)
+        if np.all(all_values == all_values[0]):
+            h_value, p_omnibus = 0.0, 1.0
+        else:
+            try:
+                omnibus = stats.kruskal(*arrays, nan_policy="omit")
+                h_value, p_omnibus = float(omnibus.statistic), float(omnibus.pvalue)
+            except ValueError:
+                h_value, p_omnibus = 0.0, 1.0
+        omnibus_rows.append({
+            "metric": metric, "n_groups": len(grouped),
+            "total_biological_replicates": sum(len(values) for values in arrays),
+            "h_statistic": h_value, "p_value": p_omnibus,
+            "test": "Kruskal-Wallis", "statistical_unit": "biological replicate / image",
+        })
+        ranks = stats.rankdata(all_values, method="average")
+        n_total = len(all_values)
+        _, ties = np.unique(all_values, return_counts=True)
+        tie_correction = 1 - float(np.sum(ties**3 - ties) / (n_total**3 - n_total))
+        variance = n_total * (n_total + 1) / 12 * tie_correction
+        means, start = [], 0
+        for values in arrays:
+            means.append(float(np.mean(ranks[start:start + len(values)])))
+            start += len(values)
+        indices = []
+        for first_index in range(len(grouped)):
+            for second_index in range(first_index + 1, len(grouped)):
+                first_name, first_values = grouped[first_index]
+                second_name, second_values = grouped[second_index]
+                se = math.sqrt(variance * (1 / len(first_values) + 1 / len(second_values))) if variance > 0 else 0
+                z_value = abs(means[first_index] - means[second_index]) / se if se else 0
+                p_value = float(2 * stats.norm.sf(z_value)) if se else 1.0
+                pairwise_rows.append({
+                    "metric": metric, "group_1": first_name, "group_2": second_name,
+                    "n_group_1": len(first_values), "n_group_2": len(second_values),
+                    "mean_rank_group_1": means[first_index],
+                    "mean_rank_group_2": means[second_index],
+                    "z_statistic": z_value, "p_value": p_value,
+                    "test": "two-sided Dunn test",
+                    "statistical_unit": "biological replicate / image",
+                })
+                indices.append(len(pairwise_rows) - 1)
+        adjusted = holm_adjust([pairwise_rows[index]["p_value"] for index in indices])
+        for index, value in zip(indices, adjusted, strict=True):
+            pairwise_rows[index]["p_value_holm_within_metric"] = value
+    return pd.DataFrame(omnibus_rows), pd.DataFrame(pairwise_rows)
+
+
+def aggregate_experiment(experiment: ExperimentSpec, cell_frames: Sequence[pd.DataFrame],
+                         qc_rows: Sequence[dict[str, object]],
+                         experiment_output: Path) -> None:
+    if not cell_frames:
+        return
+    results_dir, qc_dir = experiment_output / "results", experiment_output / "qc"
+    all_cells = pd.concat(cell_frames, ignore_index=True)
+    summary = pd.DataFrame([sample_summary_from_cells(group)
+                            for _, group in all_cells.groupby("sample_id", sort=True)])
+    summary = summary.sort_values(["time_hours", "injury", "condition", "animal"],
+                                  na_position="last")
+    atomic_write_csv(all_cells, results_dir / "all_cells_long.csv")
+    atomic_write_csv(wide_counts(all_cells, False),
+                     results_dir / "all_cells_including_zero_wide.csv")
+    atomic_write_csv(wide_counts(all_cells, True), results_dir / "nonzero_cells_wide.csv")
+    atomic_write_csv(summary, results_dir / "biological_replicate_summary.csv")
+    atomic_write_csv(pd.DataFrame(qc_rows), qc_dir / "sample_qc.csv")
+    mean_metrics = ("mean_count_all_cells", "mean_count_nonzero_cells")
+    atomic_write_csv(unpaired_ttests(summary, mean_metrics),
+                     results_dir / "mean_count_unpaired_welch_ttests.csv")
+    plot_biological_replicate_boxplots(
+        summary, mean_metrics,
+        ("Mean per-cell count: all cells", "Mean per-cell count: nonzero cells"),
+        ("mean spots / cell", "mean spots / nonzero cell"),
+        results_dir / "mean_count_biological_replicate_boxplots.png")
+    threshold_metrics = tuple(f"percent_cells_gt_{value}" for value in THRESHOLDS)
+    threshold_table = summary[["experiment", "gene", "condition", "time_hours",
+                               "injury", "animal", "sample_id", "replicate_name",
+                               *threshold_metrics]]
+    atomic_write_csv(threshold_table, results_dir / "cell_percentage_gt_1_5_10.csv")
+    atomic_write_csv(unpaired_ttests(summary, threshold_metrics),
+                     results_dir / "cell_percentage_gt_1_5_10_unpaired_welch_ttests.csv")
+    plot_biological_replicate_boxplots(
+        summary, threshold_metrics,
+        tuple(f"Cells with count > {value}" for value in THRESHOLDS),
+        tuple("cells (%)" for _ in THRESHOLDS),
+        results_dir / "cell_percentage_gt_1_5_10_boxplots.png")
+    omnibus, dunn = dunn_tests(summary, (*mean_metrics, *threshold_metrics))
+    atomic_write_csv(omnibus, results_dir / "kruskal_wallis_biological_replicates.csv")
+    atomic_write_csv(dunn, results_dir / "dunn_test_biological_replicates.csv")
+    if qc_rows:
+        fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
+        x = np.arange(len(qc_rows))
+        ax.scatter(x, [row.get("median_assignment_distance_um", math.nan) for row in qc_rows],
+                   label="median", color="#4c78a8")
+        ax.scatter(x, [row.get("p95_assignment_distance_um", math.nan) for row in qc_rows],
+                   label="95th percentile", color="#f58518")
+        ax.set_xticks(x, [str(row.get("replicate_name", row["animal"])) for row in qc_rows],
+                      rotation=90)
+        ax.set(ylabel="assignment distance (µm)",
+               title=f"Experiment {experiment.name}: nearest-nucleus distance QC")
+        ax.legend(frameon=False)
+        ax.spines[["top", "right"]].set_visible(False)
+        fig.savefig(qc_dir / "assignment_distance_by_sample.png", dpi=200,
+                    bbox_inches="tight")
+        plt.close(fig)
+
+
+def process_sample(sample: SampleSpec, parameters: Parameters,
+                   experiment_output: Path, overwrite: bool
+                   ) -> tuple[pd.DataFrame, dict[str, object]]:
+    result_dir = experiment_output / "results" / "samples" / sample.condition / sample.animal
+    qc_dir = experiment_output / "qc" / "samples" / sample.condition / sample.animal
+    example_dir = experiment_output / "example" / sample.condition / sample.animal
+    completion = qc_dir / "COMPLETE.json"
+    if completion.is_file() and not overwrite:
+        LOGGER.info("Skipping completed sample: %s", sample.sample_id)
+        cell_df = pd.read_csv(result_dir / "cell_counts.csv")
+        with (qc_dir / "sample_qc.json").open(encoding="utf-8") as stream:
+            return cell_df, json.load(stream)
+    if overwrite:
+        for directory in (result_dir, qc_dir, example_dir):
+            if directory.exists():
+                shutil.rmtree(directory)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    qc_dir.mkdir(parents=True, exist_ok=True)
+    if parameters.save_examples:
+        example_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Processing %s", sample.sample_id)
+    label_dir, label_files = locate_cleaned_label_files(
+        sample, parameters.cleaned_label_dirname)
+    spot_file = locate_spot_file(sample.results_dir)
+    spots = load_spots(spot_file)
+    cell_df, spot_df, qc, counts = assign_spots_nearest_3d(sample, label_files, spots)
+    qc.update({"replicate_name": sample.replicate_name,
+               "cleaned_label_dir": str(label_dir), "spot_file": str(spot_file)})
+    atomic_write_csv(cell_df, result_dir / "cell_counts.csv")
+    atomic_write_csv(spot_df, result_dir / "spot_assignments_nearest_3d.csv")
+    if parameters.save_assignment_maps:
+        write_assignment_count_map(label_files, counts,
+                                   result_dir / "assignment_count_map_3d.tif")
+    if parameters.save_examples:
+        metadata = create_example_images(sample, label_files, cell_df, spot_df, counts,
+                                         example_dir, parameters)
+        qc.update({
+            "example_selected_cell_id": metadata["selected_cell_id"],
+            "example_selected_cell_expression": metadata["selected_cell_expression"],
+            "example_selection_rule": metadata["selection_rule"],
+        })
+    plot_distance_qc(spot_df, qc_dir / "assignment_distance_histogram.png",
+                     sample.sample_id)
+    atomic_write_json(qc, qc_dir / "sample_qc.json")
+    atomic_write_json({
+        "status": "completed", "script_version": SCRIPT_VERSION,
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "parameters": asdict(parameters),
+    }, completion)
+    return cell_df, qc
+
+
+def run_pipeline(experiments: Sequence[ExperimentSpec], parameters: Parameters,
+                 output_root: Path, overwrite: bool, fail_fast: bool,
+                 sample_regex: str | None) -> int:
+    output_root.mkdir(parents=True, exist_ok=True)
+    atomic_write_json({
+        "script_version": SCRIPT_VERSION,
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "output_root": str(output_root),
+        "experiments": [{"name": item.name, "gene": item.gene,
+                         "root": str(item.root),
+                         "voxel_xyz_nm": list(item.voxel_xyz_nm)} for item in experiments],
+        "parameters": asdict(parameters),
+        "assignment_rule": (
+            "nearest cleaned nuclear voxel in calibrated 3-D; no maximum distance cutoff"),
+        "statistics": {
+            "unit": "biological replicate / image",
+            "t_test": "two-sided unpaired Welch",
+            "thresholds": [f"transcript_count > {value}" for value in THRESHOLDS],
+            "multiple_testing": "Holm",
+            "nonparametric": "Kruskal-Wallis followed by Dunn with Holm correction",
+        },
+    }, output_root / "run_configuration.json")
+    pattern = re.compile(sample_regex) if sample_regex else None
+    total_success, all_errors = 0, []
+    for experiment in experiments:
+        experiment_output = output_root / experiment.name
+        for subdirectory in ("example", "results", "qc"):
+            (experiment_output / subdirectory).mkdir(parents=True, exist_ok=True)
+        samples = discover_samples(experiment, parameters.channel_folder)
+        if pattern:
+            samples = [sample for sample in samples if pattern.search(sample.sample_id)]
+        LOGGER.info("Discovered %d samples for experiment %s", len(samples), experiment.name)
+        cell_frames, qc_rows, experiment_errors = [], [], []
+        for sample in samples:
+            try:
+                cell_df, qc = process_sample(sample, parameters,
+                                             experiment_output, overwrite)
+                cell_frames.append(cell_df)
+                qc_rows.append(qc)
+                total_success += 1
+            except Exception as exc:
+                LOGGER.exception("Failed sample %s", sample.sample_id)
+                error = {"experiment": experiment.name, "sample_id": sample.sample_id,
+                         "sample_path": str(sample.sample_dir),
+                         "error_type": type(exc).__name__, "error": str(exc)}
+                experiment_errors.append(error)
+                all_errors.append(error)
+                if fail_fast:
+                    break
+        if experiment_errors:
+            atomic_write_csv(pd.DataFrame(experiment_errors),
+                             experiment_output / "qc" / "processing_errors.csv")
+        aggregate_experiment(experiment, cell_frames, qc_rows, experiment_output)
+        if fail_fast and experiment_errors:
+            break
+    if all_errors:
+        atomic_write_csv(pd.DataFrame(all_errors), output_root / "processing_errors_all.csv")
+    LOGGER.info("Finished: %d successful, %d failed. Output: %s",
+                total_success, len(all_errors), output_root)
+    return 1 if all_errors else (0 if total_success else 2)
+
+
+def save_2d_tiff(path: Path, array: np.ndarray) -> None:
+    if tifffile_imread is not None:
+        from tifffile import imwrite
+        imwrite(path, array)
+    else:
+        from PIL import Image
+        Image.fromarray(array).save(path)
 
 
 def create_synthetic_experiment(base: Path) -> ExperimentSpec:
-    """Create one minimal sample with a known linked-cell assignment."""
-
-    root = base / "synthetic_experiment"
-    results = root / "Experiment" / "6h_Amputation" / "Image1" / "565" / "results"
-    labels_dir = results / "labels"
-    labels_dir.mkdir(parents=True)
-
-    # This decoy path must not be discovered: only the Experiment subtree is
-    # valid input, even when another folder contains a 565/results directory.
-    (root / "Control" / "6h_Amputation" / "Image1" / "565" / "results").mkdir(
-        parents=True
-    )
-
-    label_0 = np.zeros((40, 50), dtype=np.uint16)
-    label_0[10:18, 10:18] = 1
-    label_0[25:32, 30:38] = 2
-    label_1 = np.zeros_like(label_0)
-    label_1[11:19, 11:19] = 1  # same nucleus as projection 0, label 1
-    label_1[5:11, 35:42] = 2   # new nucleus
-    label_2 = np.zeros_like(label_0)
-    label_2[6:12, 36:43] = 1   # same nucleus as projection 1, label 2
-
-    for index, labels in enumerate((label_0, label_1, label_2)):
-        imwrite(labels_dir / f"Nucleus_Labels_{index:03d}.tif", labels)
-
-    # z,y,x; projection size 10. The first two spots should join the same
-    # global cell. One spot is near/assigned after a single expansion, one is
-    # background, and one is in the second linked cell.
-    spots = np.array(
-        [
-            [2, 14, 14],
-            [12, 15, 15],
-            [8, 20, 20],
-            [15, 0, 0],
-            [25, 8, 39],
-        ],
-        dtype=np.int64,
-    )
+    experiment = ExperimentSpec("test", "test_gene", base / "synthetic_experiment",
+                                (100.0, 100.0, 500.0))
+    results = (experiment.root / "Experiment" / "6h_Amputation" /
+               "Image1" / "565" / "results")
+    label_dir = results / CLEANED_LABEL_DIRNAME
+    label_dir.mkdir(parents=True)
+    for z in range(3):
+        plane = np.zeros((64, 80), dtype=np.uint16)
+        if z <= 1:
+            plane[10:20, 10:20] = 1
+        if z >= 1:
+            plane[40:50, 55:65] = 2
+        save_2d_tiff(label_dir / f"Nucleus_Labels_{z:04d}.tif", plane)
+    atomic_write_json({"status": "completed", "n_planes": 3},
+                      label_dir / "cleaning_summary.json")
+    spots = np.asarray([[0, 12, 12], [1, 18, 18], [2, 45, 60], [1, 38, 55]], float)
     np.save(results / "spots_post_decomposition_and_background_removed.npy", spots)
-    return ExperimentSpec(name="test", gene="test_gene", root=root)
+    raw = np.zeros((3, 64, 80), dtype=np.uint16)
+    for z, y, x in spots.astype(int):
+        raw[z, y, x] = 5000
+    write_tiff_stack(results.parent / "synthetic_565.tif", raw)
+    return experiment
 
 
 def run_self_test() -> int:
-    configure_logging(verbose=True)
-    with tempfile.TemporaryDirectory(prefix="smfish_reassignment_test_") as temporary:
-        base = Path(temporary)
+    configure_logging(True)
+    with tempfile.TemporaryDirectory(prefix="smfish_cellpose_assignment_test_") as temp:
+        base = Path(temp)
         experiment = create_synthetic_experiment(base)
         output = base / "output"
-        parameters = Parameters(
-            projection_size=10,
-            expansion_distance=3,
-            min_smaller_overlap=0.30,
-            min_iou=0.10,
-            channel_folder="565",
-            save_assignment_maps=True,
-        )
-        status = run_pipeline(
-            [experiment],
-            parameters=parameters,
-            output_root=output,
-            overwrite=True,
-            fail_fast=True,
-            sample_regex=None,
-        )
-        if status != 0:
-            raise AssertionError("Synthetic pipeline returned a nonzero status")
-        cells = pd.read_csv(output / "all_cells_long.csv")
-        qc = pd.read_csv(output / "sample_qc.csv").iloc[0]
-        positive_counts = sorted(cells.loc[cells["transcript_count"] > 0, "transcript_count"])
-        if positive_counts != [1, 2]:
-            raise AssertionError(f"Unexpected synthetic positive counts: {positive_counts}")
-        if int(qc["total_spots"]) != 5:
-            raise AssertionError("Synthetic total spot count is incorrect")
-        if not bool(qc["spot_accounting_matches"]):
-            raise AssertionError("Synthetic spot accounting failed")
+        parameters = Parameters("565", CLEANED_LABEL_DIRNAME, 32, 17, 100, True, True)
+        status = run_pipeline([experiment], parameters, output, True, True, None)
+        if status:
+            raise AssertionError(f"Synthetic pipeline returned {status}")
+        cells = pd.read_csv(output / "test" / "results" / "all_cells_long.csv")
+        if sorted(cells["transcript_count"].astype(int)) != [2, 2]:
+            raise AssertionError(f"Unexpected counts: {cells['transcript_count'].tolist()}")
+        assignments = pd.read_csv(output / "test" / "results" / "samples" /
+                                  "6h_Amputation" / "Image1" /
+                                  "spot_assignments_nearest_3d.csv")
+        if not assignments["coordinate_valid"].all():
+            raise AssertionError("Synthetic valid coordinates failed")
+        example = output / "test" / "example" / "6h_Amputation" / "Image1" / "00_example_overview.png"
+        if not example.is_file():
+            raise AssertionError("Example overview missing")
         print("SELF-TEST PASSED")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--experiment",
-        action="append",
-        type=parse_experiment_argument,
-        help=(
-            "Override defaults with NAME,GENE,ROOT. Repeat for multiple roots. "
-            "If omitted, experiments 306/307/314/332 are used."
-        ),
-    )
-    parser.add_argument(
-        "--output-root",
-        type=Path,
-        default=Path(
-            "/Volumes/Backup Plus/Experiment_results/smfish_reassignment_v2"
-        ),
-    )
-    parser.add_argument("--projection-size", type=int, default=10)
-    parser.add_argument("--expansion-distance", type=float, default=20.0)
-    parser.add_argument("--min-smaller-overlap", type=float, default=0.35)
-    parser.add_argument("--min-iou", type=float, default=0.15)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--experiment", action="append", type=parse_experiment_argument,
+                        help="Override: NAME,GENE,ROOT,X_NM,Y_NM,Z_NM (repeatable)")
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--channel-folder", default="565")
-    parser.add_argument(
-        "--save-assignment-maps",
-        action="store_true",
-        help="Write uint32 per-projection transcript-count maps (large output).",
-    )
-    parser.add_argument(
-        "--sample-regex",
-        help="Process only sample IDs matching this regular expression.",
-    )
+    parser.add_argument("--cleaned-label-dirname", default=CLEANED_LABEL_DIRNAME)
+    parser.add_argument("--crop-size", type=int, default=512)
+    parser.add_argument("--random-seed", type=int, default=20260831)
+    parser.add_argument("--max-link-lines", type=int, default=1000)
+    parser.add_argument("--sample-regex")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--no-assignment-maps", action="store_true")
+    parser.add_argument("--no-examples", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser
@@ -1025,39 +1165,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.self_test:
         return run_self_test()
-
-    if args.projection_size <= 0:
-        parser.error("--projection-size must be positive")
-    if args.expansion_distance < 0:
-        parser.error("--expansion-distance cannot be negative")
-    for value, name in (
-        (args.min_smaller_overlap, "--min-smaller-overlap"),
-        (args.min_iou, "--min-iou"),
-    ):
-        if not 0 <= value <= 1:
-            parser.error(f"{name} must be between 0 and 1")
-
+    if args.crop_size <= 0 or args.max_link_lines <= 0:
+        parser.error("--crop-size and --max-link-lines must be positive")
     configure_logging(args.verbose)
-    experiments = args.experiment or [
-        ExperimentSpec(name=name, gene=gene, root=Path(root))
-        for name, gene, root in DEFAULT_EXPERIMENTS
-    ]
-    parameters = Parameters(
-        projection_size=args.projection_size,
-        expansion_distance=args.expansion_distance,
-        min_smaller_overlap=args.min_smaller_overlap,
-        min_iou=args.min_iou,
-        channel_folder=args.channel_folder,
-        save_assignment_maps=args.save_assignment_maps,
-    )
-    return run_pipeline(
-        experiments=experiments,
-        parameters=parameters,
-        output_root=args.output_root,
-        overwrite=args.overwrite,
-        fail_fast=args.fail_fast,
-        sample_regex=args.sample_regex,
-    )
+    experiments = args.experiment or [ExperimentSpec(name, gene, Path(root), voxel)
+                                      for name, gene, root, voxel in DEFAULT_EXPERIMENTS]
+    parameters = Parameters(args.channel_folder, args.cleaned_label_dirname,
+                            args.crop_size, args.random_seed, args.max_link_lines,
+                            not args.no_assignment_maps, not args.no_examples)
+    return run_pipeline(experiments, parameters, args.output_root.expanduser(),
+                        args.overwrite, args.fail_fast, args.sample_regex)
 
 
 if __name__ == "__main__":

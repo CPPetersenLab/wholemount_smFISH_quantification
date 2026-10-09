@@ -2,7 +2,7 @@
 """Stream Cellpose-SAM 2-D nuclear segmentation and conservative 3-D tracking.
 
 The script is designed for the planarian smFISH directory layout used by
-experiments 306, 307, 314, and 332::
+experiments 304, 306, 307, 314, and 332::
 
     <experiment root>/Experiment/<condition>/<animal>/405/<animal>_405.tif
     <experiment root>/Experiment/<condition>/<animal>/565/results/
@@ -24,17 +24,13 @@ z-planes.  A disk-backed uint32 mask stack keeps the original 2-D inference
 streaming and avoids holding the multi-gigabyte image and all network flows in
 memory at once.
 
-Recommended first run on the acquisition Mac::
+The default settings are the benchmark-selected production parameters for all
+five experiments.  Recommended production run on the acquisition Mac::
 
     python cellpose_sam_nuclei_3d.py --self-test
 
-    python cellpose_sam_nuclei_3d.py \
-      --sample-regex '^306__6hr_Incision__Image1$' \
-      --device mps --diameter 90 --niter 500 \
-      --flow-threshold 0.8 --cellprob-threshold -1.75 \
-      --smooth-radius 4 --tile-overlap 0.5 --normalization plane \
-      --output-name cellpose_label_s4_cp-1p75_f0p8_d90_n500 \
-      --resume --verbose
+    caffeinate -ims python cellpose_sam_nuclei_3d.py \
+      --device mps --resume --verbose
 
 After visually checking several planes and the tracking QC, broaden the
 ``--sample-regex`` while keeping the same parameters and output name.
@@ -74,11 +70,16 @@ except ImportError:  # permit dependency-free tracking self-test
     memmap = None
 
 
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.3.0"
 LOGGER = logging.getLogger("cellpose_sam_nuclei_3d")
 
 
 DEFAULT_EXPERIMENTS = (
+    (
+        "304",
+        "wnt1",
+        "/Volumes/Backup Plus/Experiment_results/304_Analysis_results",
+    ),
     (
         "306",
         "wnt1",
@@ -1242,7 +1243,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--experiment",
         action="append",
         type=parse_experiment_argument,
-        help="Repeatable NAME,GENE,ROOT override; defaults to experiments 306/307/314/332.",
+        help=(
+            "Repeatable NAME,GENE,ROOT override; defaults to experiments "
+            "304/306/307/314/332. Supplying any --experiment replaces the "
+            "complete default list."
+        ),
     )
     parser.add_argument("--spot-channel", default="565")
     parser.add_argument("--nuclear-channel", default="405")
@@ -1250,21 +1255,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default="cpsam_v2")
     parser.add_argument("--device", choices=("auto", "mps", "cuda", "cpu"), default="auto")
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--diameter", type=float, default=None)
+    parser.add_argument(
+        "--diameter",
+        type=float,
+        default=90.0,
+        help="Expected nuclear diameter in pixels (production default: 90).",
+    )
     parser.add_argument(
         "--niter",
         type=int,
         default=500,
         help="Mask-dynamics iterations (benchmark-selected default: 500).",
     )
-    parser.add_argument("--flow-threshold", type=float, default=0.4)
-    parser.add_argument("--cellprob-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--flow-threshold",
+        type=float,
+        default=0.8,
+        help="Cellpose flow-error QC threshold (production default: 0.8).",
+    )
+    parser.add_argument(
+        "--cellprob-threshold",
+        type=float,
+        default=-1.75,
+        help="Cell-probability threshold (production default: -1.75).",
+    )
     parser.add_argument("--min-size", type=int, default=15)
-    parser.add_argument("--tile-overlap", type=float, default=0.1)
+    parser.add_argument(
+        "--tile-overlap",
+        type=float,
+        default=0.5,
+        help="Cellpose tile overlap fraction (production default: 0.5).",
+    )
     parser.add_argument(
         "--normalization",
         choices=("global", "plane", "none"),
-        default="global",
+        default="plane",
         help=(
             "global uses one sampled 1/99 range for the whole stack; plane "
             "normalizes every z-plane independently and matches benchmark "
@@ -1275,7 +1300,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--smooth-radius",
         type=float,
-        default=0.0,
+        default=4.0,
         help="Cellpose normalization low-pass smoothing radius in pixels.",
     )
     parser.add_argument(
@@ -1287,7 +1312,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compression", choices=("none", "zlib"), default="zlib")
     parser.add_argument(
         "--output-name",
-        default="cellpose_label",
+        default="cellpose_label_plane_s4_cp-1p75_f0p8_d90_n500_st0p25",
         help=(
             "Subfolder created under each 565/results directory. Use a new name "
             "for each parameter test so earlier labels are preserved."
