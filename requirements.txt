@@ -1,3 +1,0 @@
-cellpose
-big-fish
-tifffile
